@@ -133,7 +133,7 @@ class BubbleView(ctx: Context) : FrameLayout(ctx) {
             face.setColorFilter(accent)
         }
         if (cover != null && t?.key != shownKey) {
-            shownKey = t.key
+            shownKey = t?.key
             animate().scaleX(1.15f).scaleY(1.15f).setDuration(130).withEndAction {
                 animate().scaleX(1f).scaleY(1f).setDuration(260).setInterpolator(OvershootInterpolator(2f)).start()
             }.start()
