@@ -1,4 +1,9 @@
 <resources>
-    <color name="bg">#0E0E14</color>
+    <color name="bg">#05030F</color>
     <color name="ic_bg">#6C4DFF</color>
+    <color name="ic_bg_rocket">#7A2CF0</color>
+    <color name="ic_bg_planet">#0F6BD8</color>
+    <color name="ic_bg_moon">#2B2A66</color>
+    <color name="ic_bg_star">#D9368B</color>
+    <color name="ic_bg_headphones">#0E8F9A</color>
 </resources>
