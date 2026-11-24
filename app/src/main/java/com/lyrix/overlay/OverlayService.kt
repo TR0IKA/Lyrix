@@ -8,6 +8,7 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Typeface
@@ -58,12 +59,15 @@ class OverlayService : Service() {
     private lateinit var wm: WindowManager
     private var lyricsView: LyricsView? = null
     private var lyricsLp: WindowManager.LayoutParams? = null
-    private var card: PlayerCard? = null
+    private var bubble: BubbleView? = null
     private var editing = false
 
+    private var rawLines: List<LrcLine> = emptyList()
     private var lines: List<LrcLine> = emptyList()
+    private var lastSplit = -1
     private var lastIdx = -3
     private var coverColor = Color.WHITE
+    private var blurBmp: Bitmap? = null
     private var tf: Typeface? = null
     private var tfPath: String? = null
 
@@ -82,23 +86,28 @@ class OverlayService : Service() {
         return START_STICKY
     }
 
-    // ---------- foreground notification ----------
+    // ---------------------------------------------------------------- уведомление
     private fun goForeground() {
         val nm = getSystemService(NotificationManager::class.java)
         nm.createNotificationChannel(NotificationChannel(CH, "Lyrix", NotificationManager.IMPORTANCE_LOW))
-        val flags = PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), flags)
+        val fl = PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), fl)
+        val menu = PendingIntent.getActivity(
+            this, 3,
+            Intent(this, MenuActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), fl
+        )
         val edit = PendingIntent.getService(
-            this, 2, Intent(this, OverlayService::class.java).setAction(ACTION_EDIT), flags
+            this, 2, Intent(this, OverlayService::class.java).setAction(ACTION_EDIT), fl
         )
         val stop = PendingIntent.getService(
-            this, 1, Intent(this, OverlayService::class.java).setAction(ACTION_STOP), flags
+            this, 1, Intent(this, OverlayService::class.java).setAction(ACTION_STOP), fl
         )
         val n: Notification = NotificationCompat.Builder(this, CH)
             .setSmallIcon(R.drawable.ic_notif)
             .setContentTitle("Lyrix работает")
             .setContentText("Текст песни поверх экрана")
             .setContentIntent(open)
+            .addAction(0, "Меню", menu)
             .addAction(0, "Рамки", edit)
             .addAction(0, "Стоп", stop)
             .setOngoing(true)
@@ -111,7 +120,7 @@ class OverlayService : Service() {
         }
     }
 
-    // ---------- окна ----------
+    // ---------------------------------------------------------------- окна и подписки
     private fun setup() {
         wm = getSystemService(WINDOW_SERVICE) as WindowManager
         val lv = LyricsView(this)
@@ -127,8 +136,7 @@ class OverlayService : Service() {
         )
         lp.gravity = Gravity.TOP or Gravity.START
         if (Build.VERSION.SDK_INT >= 28) {
-            lp.layoutInDisplayCutoutMode =
-                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
         }
         try {
             wm.addView(lv, lp)
@@ -140,33 +148,79 @@ class OverlayService : Service() {
         lyricsView = lv
         lyricsLp = lp
 
+        if (!MediaListener.connected.value) MediaListener.rebind(applicationContext)
+
         scope.launch { Prefs.config.collect { applyConfig(it) } }
+
         scope.launch {
             NowPlaying.state.map { it.track?.key }.distinctUntilChanged().collect {
-                LyricsManager.load(applicationContext, NowPlaying.state.value.track)
+                LyricsManager.load(NowPlaying.state.value.track)
             }
         }
+        // цвет и размытие обложки
         scope.launch {
             NowPlaying.state.map { it.track?.art }.distinctUntilChanged().collect { art ->
-                coverColor = if (art != null) {
-                    withContext(Dispatchers.Default) { CoverColor.pick(art) }
-                } else Color.WHITE
+                if (art != null) {
+                    val (col, blur) = withContext(Dispatchers.Default) {
+                        Pair(CoverColor.pick(art), Blur.blurred(art))
+                    }
+                    coverColor = col
+                    blurBmp = blur
+                } else {
+                    coverColor = Color.WHITE
+                    blurBmp = null
+                }
                 updateColors()
             }
         }
-        scope.launch { NowPlaying.state.collect { bindCard() } }
+        // нет обложки у плеера: берём из избранного, иначе (если не офлайн) ищем в интернете
+        scope.launch {
+            NowPlaying.state.map { s -> s.track?.takeIf { it.art == null }?.key }.distinctUntilChanged().collect { key ->
+                val t = NowPlaying.state.value.track
+                if (key == null || t == null || t.key != key) return@collect
+                val fav = withContext(Dispatchers.IO) { Favorites.readCover(key) }
+                if (fav != null) {
+                    NowPlaying.setArt(key, fav)
+                    return@collect
+                }
+                if (!Prefs.config.value.offlineMode) {
+                    val b = ArtFetcher.fetch(t)
+                    if (b != null && NowPlaying.state.value.track?.key == key) NowPlaying.setArt(key, b)
+                }
+            }
+        }
+        scope.launch { NowPlaying.state.collect { bindBubble() } }
         scope.launch {
             LyricsManager.state.collect { s ->
-                lines = (s as? LyricsState.Found)?.lines ?: emptyList()
-                lastIdx = -3
+                rawLines = (s as? LyricsState.Found)?.lines ?: emptyList()
+                applyLines()
             }
         }
         scope.launch {
+            var noTrackMs = 0L
             while (isActive) {
                 tick()
-                delay(if (NowPlaying.state.value.playing) 50L else 250L)
+                val step = if (NowPlaying.state.value.playing) 33L else 250L
+                delay(step)
+                // страховка: если ничего не определяется, пробуем переподключить слушатель
+                if (NowPlaying.state.value.track == null) {
+                    noTrackMs += step
+                    if (noTrackMs >= 6000) {
+                        noTrackMs = 0
+                        MediaListener.rebind(applicationContext)
+                        MediaListener.instance?.refreshNow()
+                    }
+                } else noTrackMs = 0
             }
         }
+    }
+
+    private fun applyLines() {
+        val n = Prefs.config.value.splitWords
+        lastSplit = n
+        lines = Lrc.split(rawLines, n)
+        lastIdx = -3
+        lyricsView?.setLyrics(lines)
     }
 
     private fun tick() {
@@ -174,16 +228,13 @@ class OverlayService : Service() {
         val s = NowPlaying.state.value
         val cfg = Prefs.config.value
         if (lines.isNotEmpty() && s.track != null) {
-            val idx = indexFor(s.position() + cfg.offsetMs)
+            val pos = s.position() + cfg.offsetMs
+            val idx = indexFor(pos)
             if (idx != lastIdx) {
                 lastIdx = idx
-                val curText = if (idx >= 0) lines[idx].text else ""
-                val nextText = if (curText.isBlank() || !cfg.showNext) "" else lines.getOrNull(idx + 1)?.text.orEmpty()
-                lv.setLines(curText, nextText)
+                lv.setIndex(idx)
             }
-        } else if (lastIdx != -2) {
-            lastIdx = -2
-            lv.setLines("", "")
+            lv.setPosition(pos)
         }
     }
 
@@ -201,36 +252,47 @@ class OverlayService : Service() {
         return ans
     }
 
+    // ---------------------------------------------------------------- настройки и цвета
     private fun applyConfig(c: Config) {
         if (c.fontPath != tfPath) {
             tfPath = c.fontPath
             tf = c.fontPath?.let { p -> runCatching { Typeface.createFromFile(p) }.getOrNull() }
         }
+        if (c.splitWords != lastSplit) applyLines()
         lyricsView?.applyConfig(c, tf)
         updateColors()
-        lastIdx = -3
-        if (c.playerCard && card == null && !editing) addCard(c)
-        else if (!c.playerCard && card != null) removeCard()
+        if (c.bubbleShow && bubble == null && !editing) addBubble(c)
+        else if (!c.bubbleShow && bubble != null) removeBubble()
+    }
+
+    private fun resolve(mode: Int, custom: Int) = when (mode) {
+        1 -> coverColor
+        2 -> CoverColor.contrastOf(coverColor)
+        else -> custom
     }
 
     private fun accent(): Int {
         val c = Prefs.config.value
-        return if (c.colorFromCover) coverColor else c.textColor
+        return resolve(c.colorMode, c.textColor)
     }
 
     private fun updateColors() {
-        lyricsView?.setTextColor(accent())
-        bindCard()
+        val c = Prefs.config.value
+        lyricsView?.setColors(resolve(c.colorMode, c.textColor), resolve(c.hiMode, c.hiColor))
+        val bd = if (c.bdMode == 1) coverColor else c.bdColor
+        lyricsView?.setBackdrop(bd, if (c.bdMode == 2) blurBmp else null)
+        bindBubble()
     }
 
-    private fun bindCard() {
+    // ---------------------------------------------------------------- кнопка
+    private fun bindBubble() {
         val s = NowPlaying.state.value
-        card?.bind(s.track, s.playing, accent())
+        bubble?.bind(Prefs.config.value, s.track, s.playing, accent())
     }
 
-    private fun addCard(c: Config) {
+    private fun addBubble(c: Config) {
         val d = resources.displayMetrics.density
-        val cd = PlayerCard(this)
+        val b = BubbleView(this)
         val lp = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.WRAP_CONTENT,
@@ -241,34 +303,47 @@ class OverlayService : Service() {
             PixelFormat.TRANSLUCENT
         )
         lp.gravity = Gravity.TOP or Gravity.START
-        lp.x = if (c.playerX >= 0) c.playerX else (16 * d).toInt()
-        lp.y = if (c.playerY >= 0) c.playerY else (110 * d).toInt()
-        cd.wm = wm
-        cd.lp = lp
-        cd.onMoved = { x, y -> Prefs.update { it.copy(playerX = x, playerY = y) } }
+        lp.x = if (c.bubbleX >= 0) c.bubbleX else (8 * d).toInt()
+        lp.y = if (c.bubbleY >= 0) c.bubbleY else (140 * d).toInt()
+        b.wm = wm
+        b.lp = lp
+        b.onMoved = { x, y -> Prefs.update { it.copy(bubbleX = x, bubbleY = y) } }
+        b.onClick = { if (Prefs.config.value.bubbleOpensMenu) toggleMenu() }
         try {
-            wm.addView(cd, lp)
+            wm.addView(b, lp)
         } catch (e: Exception) {
             return
         }
-        card = cd
-        cd.animateIn()
-        bindCard()
+        bubble = b
+        b.animateIn()
+        bindBubble()
     }
 
-    private fun removeCard() {
-        card?.let { runCatching { wm.removeView(it) } }
-        card = null
+    private fun removeBubble() {
+        bubble?.let { runCatching { wm.removeView(it) } }
+        bubble = null
     }
 
-    // ---------- редактор рамок ----------
+    private fun toggleMenu() {
+        val m = MenuActivity.instance
+        if (m != null) {
+            m.close()
+        } else {
+            startActivity(
+                Intent(this, MenuActivity::class.java)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION)
+            )
+        }
+    }
+
+    // ---------------------------------------------------------------- редактор рамок
     private fun enterEdit() {
         val lv = lyricsView ?: return
         val lp = lyricsLp ?: return
         editing = true
         lp.flags = lp.flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE.inv()
         runCatching { wm.updateViewLayout(lv, lp) }
-        card?.visibility = View.GONE
+        bubble?.visibility = View.GONE
         lv.enterEdit(Prefs.config.value.frames) { frames ->
             Prefs.update { it.copy(frames = frames) }
             exitEdit()
@@ -282,16 +357,18 @@ class OverlayService : Service() {
         lp.flags = lp.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
         runCatching { wm.updateViewLayout(lv, lp) }
         val c = Prefs.config.value
-        if (c.playerCard) {
-            if (card == null) addCard(c) else card?.visibility = View.VISIBLE
+        if (c.bubbleShow) {
+            if (bubble == null) addBubble(c) else bubble?.visibility = View.VISIBLE
         }
     }
 
     override fun onDestroy() {
         _running.value = false
         scope.cancel()
-        lyricsView?.let { runCatching { wm.removeView(it) } }
-        removeCard()
+        if (lyricsView != null) {
+            lyricsView?.let { runCatching { wm.removeView(it) } }
+            removeBubble()
+        }
         lyricsView = null
         LyricsManager.reset()
         super.onDestroy()

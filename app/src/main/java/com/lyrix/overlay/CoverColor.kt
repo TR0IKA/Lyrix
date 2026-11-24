@@ -20,4 +20,14 @@ object CoverColor {
             Color.WHITE
         }
     }
+
+    /** Контрастный (противоположный по оттенку) цвет к данному. */
+    fun contrastOf(c: Int): Int {
+        val hsv = FloatArray(3)
+        Color.colorToHSV(c, hsv)
+        hsv[0] = (hsv[0] + 180f) % 360f
+        hsv[1] = hsv[1].coerceIn(0.55f, 0.9f)
+        hsv[2] = 1f
+        return Color.HSVToColor(hsv)
+    }
 }

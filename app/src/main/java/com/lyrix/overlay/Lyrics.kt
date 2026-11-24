@@ -1,6 +1,8 @@
 package com.lyrix.overlay
 
-import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Color
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -10,6 +12,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -39,6 +42,52 @@ object Lrc {
         }
         return out.sortedBy { it.timeMs }
     }
+
+    /** Делит каждую строку на части по n слов; время частей распределяется по длине строки. */
+    fun split(lines: List<LrcLine>, n: Int): List<LrcLine> {
+        if (n <= 0) return lines
+        val out = ArrayList<LrcLine>()
+        for (i in lines.indices) {
+            val l = lines[i]
+            val words = l.text.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
+            if (words.size <= n) {
+                out += l
+                continue
+            }
+            val t0 = l.timeMs
+            val t1 = lines.getOrNull(i + 1)?.timeMs ?: (t0 + 5000)
+            val total = words.sumOf { it.length + 1 }
+            val dur = minOf(t1 - t0, maxOf(1500L, total * 150L)).coerceAtLeast(300L)
+            var acc = 0
+            var w = 0
+            while (w < words.size) {
+                val chunk = words.subList(w, minOf(w + n, words.size))
+                out += LrcLine(t0 + dur * acc / total, chunk.joinToString(" "))
+                acc += chunk.sumOf { it.length + 1 }
+                w += n
+            }
+        }
+        return out
+    }
+}
+
+object Net {
+    fun enc(s: String): String = URLEncoder.encode(s, "UTF-8")
+
+    fun get(url: String): String? {
+        var c: HttpURLConnection? = null
+        return try {
+            c = URL(url).openConnection() as HttpURLConnection
+            c.connectTimeout = 8000
+            c.readTimeout = 8000
+            c.setRequestProperty("User-Agent", "Lyrix/1.1 (Android)")
+            if (c.responseCode != 200) null else c.inputStream.bufferedReader().use { it.readText() }
+        } catch (e: Exception) {
+            null
+        } finally {
+            c?.disconnect()
+        }
+    }
 }
 
 sealed interface LyricsState {
@@ -55,20 +104,33 @@ object LyricsManager {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var job: Job? = null
 
-    fun load(ctx: Context, track: Track?) {
+    private fun cacheFile(t: Track) = File(Favorites.app.cacheDir, "lrc_${t.key.hashCode()}.lrc")
+
+    /** Только то, что уже лежит на устройстве: свой текст → избранное → кэш. */
+    fun localText(t: Track): String? {
+        LocalStore.custom(t.key)?.let { return it }
+        Favorites.readLyrics(t.key)?.let { return it }
+        val f = cacheFile(t)
+        return if (f.exists()) runCatching { f.readText() }.getOrNull()?.takeIf { it.isNotBlank() } else null
+    }
+
+    fun reload() = load(NowPlaying.state.value.track)
+
+    fun load(track: Track?) {
         job?.cancel()
         if (track == null) {
             _state.value = LyricsState.Idle
             return
         }
         _state.value = LyricsState.Loading
-        val dir = ctx.cacheDir
         job = scope.launch {
-            val f = File(dir, "lrc_${track.key.hashCode()}.lrc")
-            var text: String? = if (f.exists()) runCatching { f.readText() }.getOrNull() else null
-            if (text == null) {
-                text = fetch(track)
-                if (text != null) runCatching { f.writeText(text) }
+            var text = localText(track)
+            if (text == null && !Prefs.config.value.offlineMode) {
+                text = fetchOnline(track)
+                if (text != null) {
+                    runCatching { cacheFile(track).writeText(text) }
+                    if (Favorites.isFav(track.key)) Favorites.saveLyrics(track.key, text)
+                }
             }
             ensureActive()
             val lines = text?.let { Lrc.parse(it) }.orEmpty()
@@ -81,40 +143,40 @@ object LyricsManager {
         _state.value = LyricsState.Idle
     }
 
-    private fun enc(s: String) = URLEncoder.encode(s, "UTF-8")
-
-    private fun httpGet(url: String): String? {
-        var c: HttpURLConnection? = null
-        return try {
-            c = URL(url).openConnection() as HttpURLConnection
-            c.connectTimeout = 8000
-            c.readTimeout = 8000
-            c.setRequestProperty("User-Agent", "Lyrix/1.0 (Android)")
-            if (c.responseCode != 200) null else c.inputStream.bufferedReader().use { it.readText() }
-        } catch (e: Exception) {
-            null
-        } finally {
-            c?.disconnect()
-        }
+    fun clearCache() {
+        Favorites.app.cacheDir.listFiles()?.filter { it.name.startsWith("lrc_") }?.forEach { it.delete() }
     }
 
-    private fun fetch(t: Track): String? {
+    fun cacheInfo(): String {
+        val files = Favorites.app.cacheDir.listFiles()?.filter { it.name.startsWith("lrc_") } ?: emptyList()
+        return "${files.size} файл(ов), ${files.sumOf { it.length() } / 1024} КБ"
+    }
+
+    /** Ищет синхронизированный текст на lrclib.net (учитывает ремиксы: убирает «- Remix», скобки и т.п.). */
+    fun fetchOnline(t: Track): String? {
         val dur = (t.durationMs / 1000).toInt()
-        var getUrl = "https://lrclib.net/api/get?track_name=${enc(t.title)}&artist_name=${enc(t.artist)}"
-        if (t.album.isNotBlank()) getUrl += "&album_name=${enc(t.album)}"
+        var getUrl = "https://lrclib.net/api/get?track_name=${Net.enc(t.title)}&artist_name=${Net.enc(t.artist)}"
+        if (t.album.isNotBlank()) getUrl += "&album_name=${Net.enc(t.album)}"
         if (dur > 0) getUrl += "&duration=$dur"
-        val exact = httpGet(getUrl)?.let { body ->
+        val exact = Net.get(getUrl)?.let { body ->
             runCatching { JSONObject(body).optString("syncedLyrics") }.getOrNull()
         }
         if (!exact.isNullOrBlank() && exact != "null") return exact
 
-        val clean = t.title.replace(Regex("""\s*[(\[].*?[)\]]"""), "").trim().ifEmpty { t.title }
+        var clean = t.title.replace(Regex("""\s*[(\[].*?[)\]]"""), "")
+        clean = clean.replace(
+            Regex("""\s+[-–]\s+.*(remix|mix|edit|version|remaster|live|slowed|sped|reverb|acoustic).*""", RegexOption.IGNORE_CASE),
+            ""
+        ).trim().ifEmpty { t.title }
         val urls = listOf(
-            "https://lrclib.net/api/search?track_name=${enc(clean)}&artist_name=${enc(t.artist)}",
-            "https://lrclib.net/api/search?q=${enc(t.artist + " " + clean)}"
+            "https://lrclib.net/api/search?track_name=${Net.enc(clean)}&artist_name=${Net.enc(t.artist)}",
+            "https://lrclib.net/api/search?q=${Net.enc(t.artist + " " + clean)}",
+            "https://lrclib.net/api/search?q=${Net.enc(clean)}"
         )
+        var loose: String? = null
+        var looseDiff = Int.MAX_VALUE
         for (url in urls) {
-            val body = httpGet(url) ?: continue
+            val body = Net.get(url) ?: continue
             val arr = runCatching { JSONArray(body) }.getOrNull() ?: continue
             var best: String? = null
             var bestDiff = Int.MAX_VALUE
@@ -129,7 +191,60 @@ object LyricsManager {
                 }
             }
             if (best != null && (dur <= 0 || bestDiff <= 15)) return best
+            if (best != null && bestDiff < looseDiff) {
+                loose = best
+                looseDiff = bestDiff
+            }
         }
-        return null
+        // ремикс с другой длиной: берём ближайший по длине, тайминг можно подвинуть ползунком «Синхронизация»
+        return if (loose != null && looseDiff <= 90) loose else null
+    }
+}
+
+/** Ищет обложку в интернете, если плеер её не передал (iTunes Search). */
+object ArtFetcher {
+    suspend fun fetch(t: Track): Bitmap? = withContext(Dispatchers.IO) {
+        try {
+            val q = Net.enc("${t.artist} ${t.title}")
+            val body = Net.get("https://itunes.apple.com/search?term=$q&entity=song&limit=1")
+            val url = body?.let { JSONObject(it).getJSONArray("results").optJSONObject(0)?.optString("artworkUrl100") }
+            if (url.isNullOrBlank()) null
+            else URL(url.replace("100x100", "600x600")).openStream().use { BitmapFactory.decodeStream(it) }
+        } catch (e: Exception) {
+            null
+        }
+    }
+}
+
+object Blur {
+    /** Дешёвое размытие: уменьшаем до 48 px и размываем боксом. */
+    fun blurred(src: Bitmap): Bitmap {
+        val size = 48
+        val small = Bitmap.createScaledBitmap(src, size, size, true).copy(Bitmap.Config.ARGB_8888, true)
+        val px = IntArray(size * size)
+        small.getPixels(px, 0, size, 0, 0, size, size)
+        repeat(2) {
+            box(px, size, true)
+            box(px, size, false)
+        }
+        small.setPixels(px, 0, size, 0, 0, size, size)
+        return small
+    }
+
+    private fun box(px: IntArray, n: Int, horizontal: Boolean) {
+        val r = 4
+        val tmp = IntArray(px.size)
+        for (y in 0 until n) for (x in 0 until n) {
+            var a = 0; var rr = 0; var g = 0; var b = 0; var cnt = 0
+            for (k in -r..r) {
+                val xx = if (horizontal) x + k else x
+                val yy = if (horizontal) y else y + k
+                if (xx < 0 || yy < 0 || xx >= n || yy >= n) continue
+                val c = px[yy * n + xx]
+                a += Color.alpha(c); rr += Color.red(c); g += Color.green(c); b += Color.blue(c); cnt++
+            }
+            tmp[y * n + x] = Color.argb(a / cnt, rr / cnt, g / cnt, b / cnt)
+        }
+        System.arraycopy(tmp, 0, px, 0, px.size)
     }
 }

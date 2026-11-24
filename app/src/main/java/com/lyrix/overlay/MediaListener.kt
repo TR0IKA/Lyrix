@@ -1,19 +1,48 @@
 package com.lyrix.overlay
 
 import android.content.ComponentName
+import android.content.Context
 import android.graphics.Bitmap
 import android.media.MediaMetadata
 import android.media.session.MediaController
 import android.media.session.MediaSessionManager
 import android.media.session.PlaybackState
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import android.service.notification.NotificationListenerService
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 
 /**
- * Слушает активные медиа-сессии (Spotify, YouTube Music, Яндекс Музыка и т.д.).
- * Для этого нужен доступ к уведомлениям.
+ * Слушает активные медиа-сессии. Для этого нужен доступ к уведомлениям.
+ * Каждые 2 секунды сам сверяется со списком сессий и переподключается, если система его отвязала.
  */
 class MediaListener : NotificationListenerService() {
+
+    companion object {
+        private val _connected = MutableStateFlow(false)
+        val connected: StateFlow<Boolean> = _connected.asStateFlow()
+
+        @Volatile
+        var instance: MediaListener? = null
+
+        fun rebind(ctx: Context) {
+            try {
+                NotificationListenerService.requestRebind(ComponentName(ctx, MediaListener::class.java))
+            } catch (e: Exception) {
+            }
+        }
+    }
+
+    private val handler = Handler(Looper.getMainLooper())
+    private val poll = object : Runnable {
+        override fun run() {
+            refreshNow()
+            handler.postDelayed(this, 2000)
+        }
+    }
 
     private var msm: MediaSessionManager? = null
     private var comp: ComponentName? = null
@@ -32,27 +61,33 @@ class MediaListener : NotificationListenerService() {
         }
 
         override fun onSessionDestroyed() {
-            refresh()
+            refreshNow()
         }
     }
 
     private val sessionsListener =
-        MediaSessionManager.OnActiveSessionsChangedListener { list -> setControllers(list ?: emptyList()) }
+        MediaSessionManager.OnActiveSessionsChangedListener { list ->
+            setControllers((list ?: emptyList()).filter { it.packageName != packageName })
+        }
 
     override fun onListenerConnected() {
         super.onListenerConnected()
+        instance = this
+        _connected.value = true
         comp = ComponentName(this, MediaListener::class.java)
         msm = getSystemService(MediaSessionManager::class.java)
         try {
             msm?.addOnActiveSessionsChangedListener(sessionsListener, comp)
         } catch (e: SecurityException) {
-            return
         }
-        refresh()
+        refreshNow()
+        handler.removeCallbacks(poll)
+        handler.postDelayed(poll, 2000)
     }
 
     override fun onListenerDisconnected() {
         super.onListenerDisconnected()
+        handler.removeCallbacks(poll)
         try {
             msm?.removeOnActiveSessionsChangedListener(sessionsListener)
         } catch (e: Exception) {
@@ -60,21 +95,33 @@ class MediaListener : NotificationListenerService() {
         controllers.forEach { it.unregisterCallback(cb) }
         controllers = emptyList()
         current = null
+        instance = null
+        _connected.value = false
         NowPlaying.controller = null
         NowPlaying.set(PlayState())
+        rebind(this)
     }
 
-    private fun refresh() {
+    override fun onDestroy() {
+        handler.removeCallbacks(poll)
+        if (instance === this) instance = null
+        super.onDestroy()
+    }
+
+    fun refreshNow() {
         try {
             val m = msm ?: return
-            setControllers(m.getActiveSessions(comp))
+            val list = m.getActiveSessions(comp).filter { it.packageName != packageName }
+            val same = list.size == controllers.size &&
+                list.indices.all { list[it].sessionToken == controllers[it].sessionToken }
+            if (same) publish() else setControllers(list)
         } catch (e: SecurityException) {
         }
     }
 
     private fun setControllers(list: List<MediaController>) {
         controllers.forEach { it.unregisterCallback(cb) }
-        controllers = list.filter { it.packageName != packageName }
+        controllers = list
         controllers.forEach { it.registerCallback(cb) }
         publish()
     }
@@ -119,12 +166,16 @@ class MediaListener : NotificationListenerService() {
             }
         }
 
+        val finalTrack = if (track.art == null) {
+            NowPlaying.artFor(track.key)?.let { track.copy(art = it) } ?: track
+        } else track
+
         val ps = best.playbackState
         val playing = ps?.state == PlaybackState.STATE_PLAYING
         val pos = ps?.position?.takeIf { it >= 0 } ?: 0L
         val upd = ps?.lastPositionUpdateTime?.takeIf { it > 0 } ?: SystemClock.elapsedRealtime()
         val speed = ps?.playbackSpeed?.takeIf { it > 0f } ?: 1f
-        NowPlaying.set(PlayState(track, playing, pos, upd, speed))
+        NowPlaying.set(PlayState(finalTrack, playing, pos, upd, speed))
     }
 
     private fun scale(b: Bitmap): Bitmap {

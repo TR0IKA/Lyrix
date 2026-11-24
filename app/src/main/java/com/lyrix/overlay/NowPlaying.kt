@@ -6,6 +6,7 @@ import android.os.SystemClock
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 
 data class Track(
     val title: String,
@@ -37,6 +38,24 @@ object NowPlaying {
 
     @Volatile
     var controller: MediaController? = null
+
+    @Volatile
+    private var artKey: String? = null
+
+    @Volatile
+    private var artBmp: Bitmap? = null
+
+    /** Обложка, найденная приложением (из избранного или интернета), если плеер её не дал. */
+    fun artFor(key: String): Bitmap? = if (artKey == key) artBmp else null
+
+    fun setArt(key: String, bmp: Bitmap) {
+        artKey = key
+        artBmp = bmp
+        _state.update { s ->
+            val t = s.track
+            if (t != null && t.key == key && t.art == null) s.copy(track = t.copy(art = bmp)) else s
+        }
+    }
 
     fun set(s: PlayState) {
         _state.value = s
