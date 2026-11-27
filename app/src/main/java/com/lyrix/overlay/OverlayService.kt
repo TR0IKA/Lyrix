@@ -183,6 +183,13 @@ class OverlayService : Service() {
                     NowPlaying.setArt(key, fav)
                     return@collect
                 }
+                val byUri = t.artUri?.let {
+                    ArtFetcher.fromUri(applicationContext, it, !Prefs.config.value.offlineMode)
+                }
+                if (byUri != null) {
+                    NowPlaying.setArt(key, byUri)
+                    return@collect
+                }
                 if (!Prefs.config.value.offlineMode) {
                     val b = ArtFetcher.fetch(t)
                     if (b != null && NowPlaying.state.value.track?.key == key) NowPlaying.setArt(key, b)

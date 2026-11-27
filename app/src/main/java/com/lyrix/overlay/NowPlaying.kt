@@ -14,9 +14,16 @@ data class Track(
     val album: String,
     val durationMs: Long,
     val art: Bitmap?,
-    val pkg: String
+    val pkg: String,
+    val artUri: String? = null
 ) {
-    val key: String get() = "$artist|$title|$durationMs"
+    /** Ключ не зависит от длительности: она у разных плееров и запусков отличается. */
+    val key: String get() = trackKey(artist, title)
+}
+
+fun trackKey(artist: String, title: String): String {
+    fun norm(s: String) = s.lowercase().replace(Regex("\\s+"), " ").trim()
+    return norm(artist) + "|" + norm(title)
 }
 
 data class PlayState(

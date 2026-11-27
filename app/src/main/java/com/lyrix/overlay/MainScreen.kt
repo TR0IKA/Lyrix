@@ -49,7 +49,9 @@ class MainActions(
     val pickBubbleIcon: () -> Unit,
     val pickShortcutIcon: () -> Unit,
     val exportCfg: () -> Unit,
-    val importCfg: () -> Unit
+    val importCfg: () -> Unit,
+    val addAudio: () -> Unit,
+    val attachAudio: (Fav) -> Unit
 )
 
 fun lyricsStatus(hasTrack: Boolean, running: Boolean, lyr: LyricsState, offline: Boolean): Pair<String, Color> = when {
@@ -58,7 +60,7 @@ fun lyricsStatus(hasTrack: Boolean, running: Boolean, lyr: LyricsState, offline:
     else -> when (lyr) {
         LyricsState.Loading -> (if (offline) "Ищу в избранном и кэше…" else "Ищу текст…") to Sp.Cyan
         is LyricsState.Found -> "Текст найден" to Sp.Good
-        LyricsState.NotFound -> (if (offline) "Офлайн: этого трека нет в избранном" else "Текст не найден") to Sp.Bad
+        LyricsState.NotFound -> (if (offline) "Офлайн: этого трека нет в избранном и кэше" else "Текст не найден") to Sp.Bad
         LyricsState.Idle -> "" to Sp.Muted
     }
 }
@@ -144,14 +146,16 @@ private fun IconTile(
 }
 
 @Composable
-private fun FavRow(f: Fav) {
+private fun FavRow(f: Fav, actions: MainActions) {
     val ctx = LocalContext.current
+    val lib by Library.list.collectAsState()
+    val local = lib.firstOrNull { it.key == f.key }
     val cover = remember(f.id, Favorites.coverFile(f.id).lastModified()) {
         val file = Favorites.coverFile(f.id)
         if (file.exists()) BitmapFactory.decodeFile(file.path, BitmapFactory.Options().apply { inSampleSize = 4 }) else null
     }
     val hasLyrics = Favorites.lyricsFile(f.id).exists()
-    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
         Box(Modifier.size(48.dp).clip(RoundedCornerShape(12.dp)).background(Color(0xFF2A2A44)), contentAlignment = Alignment.Center) {
             if (cover != null) {
                 Image(cover.asImageBitmap(), null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
@@ -161,9 +165,15 @@ private fun FavRow(f: Fav) {
             Text(f.title, color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
             Text(f.artist, color = Sp.Muted, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
             Text(
-                "обложка ${if (cover != null) "✓" else "—"} · текст ${if (hasLyrics) "✓" else "—"}",
+                "обложка ${if (cover != null) "✓" else "—"} · текст ${if (hasLyrics) "✓" else "—"} · файл ${if (local != null) "✓" else "—"}",
                 color = if (cover != null && hasLyrics) Sp.Good else Sp.Muted, fontSize = 11.sp
             )
+        }
+        if (local == null) {
+            Box(
+                Modifier.size(36.dp).bounceClick { actions.attachAudio(f) }.clip(CircleShape).background(Color(0x22FFFFFF)),
+                contentAlignment = Alignment.Center
+            ) { Text("♪+", color = Sp.Cyan, fontSize = 12.sp, fontWeight = FontWeight.Bold) }
         }
         Box(
             Modifier.size(40.dp).bounceClick { FavLauncher.play(ctx, f) }.clip(CircleShape)
@@ -172,6 +182,42 @@ private fun FavRow(f: Fav) {
         ) { Text("▶", color = Sp.Bg0, fontSize = 14.sp) }
         Box(
             Modifier.size(36.dp).bounceClick { Favorites.removeById(f.id) }.clip(CircleShape).background(Color(0x22FFFFFF)),
+            contentAlignment = Alignment.Center
+        ) { Text("✕", color = Color.White, fontSize = 13.sp) }
+    }
+}
+
+@Composable
+private fun LibRow(t: LibTrack, playing: Boolean, isFav: Boolean) {
+    val ctx = LocalContext.current
+    val cover = remember(t.id) {
+        val file = Library.coverFile(t)
+        if (file.exists()) BitmapFactory.decodeFile(file.path, BitmapFactory.Options().apply { inSampleSize = 4 }) else null
+    }
+    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+        Box(Modifier.size(48.dp).clip(RoundedCornerShape(12.dp)).background(Color(0xFF2A2A44)), contentAlignment = Alignment.Center) {
+            if (cover != null) {
+                Image(cover.asImageBitmap(), null, contentScale = ContentScale.Crop, modifier = Modifier.fillMaxSize())
+            } else Text("♪", color = Sp.Muted)
+        }
+        Column(Modifier.weight(1f)) {
+            Text(
+                t.title, color = if (playing) Sp.Cyan else Color.White, fontSize = 14.sp,
+                fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis
+            )
+            Text(t.artist.ifBlank { "—" }, color = Sp.Muted, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        }
+        Box(
+            Modifier.size(36.dp).bounceClick { if (isFav) Favorites.remove(t.key) else Favorites.addFromLib(t) },
+            contentAlignment = Alignment.Center
+        ) { Text(if (isFav) "♥" else "♡", color = if (isFav) Sp.Pink else Sp.Muted, fontSize = 22.sp) }
+        Box(
+            Modifier.size(40.dp).bounceClick { PlayerService.play(ctx, t.id) }.clip(CircleShape)
+                .background(Brush.linearGradient(listOf(Sp.Violet, Sp.Cyan))),
+            contentAlignment = Alignment.Center
+        ) { Text(if (playing) "♪" else "▶", color = Sp.Bg0, fontSize = 14.sp) }
+        Box(
+            Modifier.size(36.dp).bounceClick { Library.remove(t.id) }.clip(CircleShape).background(Color(0x22FFFFFF)),
             contentAlignment = Alignment.Center
         ) { Text("✕", color = Color.White, fontSize = 13.sp) }
     }
@@ -221,6 +267,9 @@ private fun MainContent(perms: PermState, actions: MainActions, openDev: () -> U
     val running by OverlayService.running.collectAsState()
     val lyr by LyricsManager.state.collectAsState()
     val favs by Favorites.list.collectAsState()
+    val lib by Library.list.collectAsState()
+    val playingLib by PlayerService.current.collectAsState()
+    val connected by MediaListener.connected.collectAsState()
     val allOk = perms.overlay && perms.listener
     val track = now.track
     val art = track?.art
@@ -255,16 +304,36 @@ private fun MainContent(perms: PermState, actions: MainActions, openDev: () -> U
         }
 
         EnterItem(2) {
-            AnimatedVisibility(!allOk, enter = fadeIn() + expandVertically(), exit = fadeOut() + shrinkVertically()) {
-                GlassCard {
-                    SectionTitle("Разрешения")
-                    PermRow("Показ поверх других приложений", perms.overlay) {
-                        ctx.startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:${ctx.packageName}")))
+            Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
+                AnimatedVisibility(!allOk, enter = fadeIn() + expandVertically(), exit = fadeOut() + shrinkVertically()) {
+                    GlassCard {
+                        SectionTitle("Разрешения")
+                        PermRow("Показ поверх других приложений", perms.overlay) {
+                            ctx.startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:${ctx.packageName}")))
+                        }
+                        PermRow("Доступ к уведомлениям (видеть, что играет)", perms.listener) {
+                            ctx.startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+                        }
+                        HintText("Если переключатель серый: Настройки → Приложения → Lyrix → ⋮ → «Разрешить ограниченные настройки».")
                     }
-                    PermRow("Доступ к уведомлениям (видеть, что играет)", perms.listener) {
-                        ctx.startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+                }
+                AnimatedVisibility(perms.listener && !connected, enter = fadeIn() + expandVertically(), exit = fadeOut() + shrinkVertically()) {
+                    GlassCard {
+                        SectionTitle("Треки не определяются")
+                        HintText("Система отключила слушатель медиа. Нажми «Переподключить». Если не помогло — выключи и снова включи доступ к уведомлениям для Lyrix и убери ограничения батареи.")
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            SpaceButton("Переподключить") {
+                                MediaListener.rebind(ctx)
+                                MediaListener.instance?.refreshNow()
+                            }
+                            SpaceButton("Батарея", filled = false) {
+                                ctx.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+                            }
+                            SpaceButton("Уведомления", filled = false) {
+                                ctx.startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+                            }
+                        }
                     }
-                    HintText("Если переключатель серый: Настройки → Приложения → Lyrix → ⋮ → «Разрешить ограниченные настройки».")
                 }
             }
         }
@@ -374,9 +443,19 @@ private fun MainContent(perms: PermState, actions: MainActions, openDev: () -> U
                 if (favs.isEmpty()) {
                     HintText("Нажми ♡ у играющего трека — обложка и текст сохранятся в приложении и будут открываться мгновенно и без интернета.")
                 } else {
-                    favs.forEach { FavRow(it) }
+                    favs.forEach { FavRow(it, actions) }
                     HintText("▶ запускает трек в том плеере, откуда он был добавлен (если плеер поддерживает поиск по команде).")
                 }
+            }
+        }
+
+        // моя музыка
+        EnterItem(8) {
+            GlassCard {
+                SectionTitle("Моя музыка")
+                HintText("Свои файлы (mp3, flac, m4a…) копируются в приложение и играют прямо в нём — полностью офлайн, с текстом поверх экрана. Музыку из Spotify, YouTube и других сервисов приложение скачать не может.")
+                SpaceButton("Добавить файлы", onClick = actions.addAudio)
+                lib.forEach { LibRow(it, playingLib?.id == it.id, favs.any { f -> f.key == it.key }) }
             }
         }
 
@@ -384,7 +463,7 @@ private fun MainContent(perms: PermState, actions: MainActions, openDev: () -> U
         EnterItem(8) {
             GlassCard {
                 SectionTitle("Зоны без текста")
-                SwitchRow("Скрыть текст по центру", "Полоса посреди экрана без текста", cfg.hideCenter) { v ->
+                SwitchRow("Скрыть текст по центру", "Текст сдвигается выше или ниже полосы, а не пропадает", cfg.hideCenter) { v ->
                     Prefs.update { it.copy(hideCenter = v) }
                 }
                 AnimatedVisibility(cfg.hideCenter, enter = fadeIn() + expandVertically(), exit = fadeOut() + shrinkVertically()) {
@@ -400,7 +479,7 @@ private fun MainContent(perms: PermState, actions: MainActions, openDev: () -> U
                         else Toast.makeText(ctx, "Сначала выдай разрешения", Toast.LENGTH_SHORT).show()
                     }
                 }
-                HintText("Совет: открой нужное приложение, потяни шторку и нажми «Рамки» в уведомлении Lyrix.")
+                HintText("Текст не прячется в рамках, а сдвигается к ближайшему свободному месту (если места нет — обрезается). Совет: открой нужное приложение, потяни шторку и нажми «Рамки» в уведомлении Lyrix.")
             }
         }
 

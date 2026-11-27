@@ -48,7 +48,10 @@ object Favorites {
     fun idOf(key: String): String =
         MessageDigest.getInstance("MD5").digest(key.toByteArray()).joinToString("") { "%02x".format(it) }.take(16)
 
-    private fun dir(key: String) = File(root, idOf(key))
+    private fun dir(key: String): File {
+        val known = _list.value.firstOrNull { it.key == key }
+        return if (known != null) File(root, known.id) else File(root, idOf(key))
+    }
     fun dirOf(id: String) = File(root, id)
     fun isFav(key: String) = _list.value.any { it.key == key }
     fun coverFile(id: String) = File(dirOf(id), "cover.jpg")
@@ -76,7 +79,7 @@ object Favorites {
             if (m.exists()) runCatching {
                 val o = JSONObject(m.readText())
                 out += Fav(
-                    d.name, o.getString("key"), o.getString("title"), o.optString("artist"),
+                    d.name, trackKey(o.optString("artist"), o.getString("title")), o.getString("title"), o.optString("artist"),
                     o.optString("album"), o.optLong("durationMs"), o.optString("pkg"), o.optLong("addedAt")
                 )
             }
@@ -86,6 +89,11 @@ object Favorites {
 
     fun toggle(t: Track) {
         if (isFav(t.key)) remove(t.key) else add(t)
+    }
+
+    /** Добавляет трек из «Моей музыки» в избранное (обложка и текст сохраняются как обычно). */
+    fun addFromLib(t: LibTrack) {
+        add(Track(t.title, t.artist, t.album, t.durationMs, Library.cover(t), app.packageName))
     }
 
     fun add(t: Track) {
@@ -157,6 +165,11 @@ object LocalStore {
 /** Запуск избранного трека в том плеере, откуда он был добавлен. */
 object FavLauncher {
     fun play(ctx: Context, f: Fav) {
+        val local = Library.find(f.key)
+        if (local != null) {
+            PlayerService.play(ctx, local.id)
+            return
+        }
         val q = "${f.artist} ${f.title}".trim()
         val c = NowPlaying.controller
         if (c != null && c.packageName == f.pkg) {

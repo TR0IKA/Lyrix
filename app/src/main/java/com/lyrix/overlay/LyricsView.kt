@@ -65,6 +65,11 @@ class LyricsView(ctx: Context) : View(ctx) {
     private var progress = 1f
     private var hp = 0f
 
+    // сдвиг текста, чтобы он не попадал в рамки и центральную полосу
+    private var avDx = 0f
+    private var avDy = 0f
+    private val avRect = RectF()
+
     // поп-ап
     private var popX = 0f
     private var popY = 0f
@@ -389,11 +394,14 @@ class LyricsView(ctx: Context) : View(ctx) {
         val w = width.toFloat()
         val h = height.toFloat()
         canvas.save()
+        // подстраховка: в зонах текст всё равно не рисуется
         for (f in cfg.frames) canvas.clipOutRect(f.l * w, f.t * h, f.r * w, f.b * h)
         if (cfg.hideCenter) {
             val bh = cfg.centerSize * h
             canvas.clipOutRect(0f, (h - bh) / 2f, w, (h + bh) / 2f)
         }
+        val moving = updateAvoid()
+        canvas.translate(avDx, avDy)
         drawBackdrop(canvas)
         when (cfg.subStyle) {
             1 -> drawClassic(canvas, true)
@@ -402,19 +410,93 @@ class LyricsView(ctx: Context) : View(ctx) {
             else -> drawClassic(canvas, false)
         }
         canvas.restore()
+        if (moving) postInvalidateOnAnimation()
     }
 
-    private fun computeBackdropTarget(): Boolean {
+    private fun zones(): List<RectF> {
         val w = width.toFloat()
         val h = height.toFloat()
-        val padX = 18 * dp
-        val padY = 12 * dp
+        val out = ArrayList<RectF>()
+        for (f in cfg.frames) out += RectF(f.l * w, f.t * h, f.r * w, f.b * h)
+        if (cfg.hideCenter) {
+            val bh = cfg.centerSize * h
+            out += RectF(0f, (h - bh) / 2f, w, (h + bh) / 2f)
+        }
+        return out
+    }
+
+    /** Ищет ближайший сдвиг (dx, dy), при котором прямоугольник r не пересекает ни одну зону. null — места нет. */
+    private fun solveAvoid(r: RectF): FloatArray? {
+        val zs = zones()
+        if (zs.isEmpty()) return floatArrayOf(0f, 0f)
+        val w = width.toFloat()
+        val h = height.toFloat()
+        val gap = 8 * dp
+        val t = RectF()
+        fun free(dx: Float, dy: Float): Boolean {
+            t.set(r.left + dx, r.top + dy, r.right + dx, r.bottom + dy)
+            if (t.left < 0f || t.top < 0f || t.right > w || t.bottom > h) return false
+            for (z in zs) if (RectF.intersects(z, t)) return false
+            return true
+        }
+        if (free(0f, 0f)) return floatArrayOf(0f, 0f)
+        val dxs = ArrayList<Float>()
+        val dys = ArrayList<Float>()
+        dxs += 0f
+        dys += 0f
+        for (z in zs) {
+            dxs += z.left - gap - r.right
+            dxs += z.right + gap - r.left
+            dys += z.top - gap - r.bottom
+            dys += z.bottom + gap - r.top
+        }
+        var bx = 0f
+        var by = 0f
+        var bd = Float.MAX_VALUE
+        var found = false
+        for (dx in dxs) for (dy in dys) {
+            val d = hypot(dx, dy)
+            if (d < bd && free(dx, dy)) {
+                bd = d
+                bx = dx
+                by = dy
+                found = true
+            }
+        }
+        return if (found) floatArrayOf(bx, by) else null
+    }
+
+    private fun approach(cur: Float, target: Float): Float {
+        val v = cur + (target - cur) * 0.25f
+        return if (abs(v - target) <= 0.5f) target else v
+    }
+
+    /** Плавно двигает текст к свободному месту. Возвращает true, пока движение не закончилось. */
+    private fun updateAvoid(): Boolean {
+        var tx = 0f
+        var ty = 0f
+        if (cfg.subStyle != 2 && blockRect(avRect)) {
+            val s = solveAvoid(avRect)
+            if (s != null) {
+                tx = s[0]
+                ty = s[1]
+            }
+        }
+        avDx = approach(avDx, tx)
+        avDy = approach(avDy, ty)
+        return avDx != tx || avDy != ty
+    }
+
+    /** Прямоугольник, который занимает текст (без подложки). */
+    private fun blockRect(out: RectF): Boolean {
+        val w = width.toFloat()
+        val h = height.toFloat()
         return when (cfg.subStyle) {
             3 -> {
                 if (lines.isEmpty()) false else {
-                    val half = cfg.wheelRows / 2f + 0.6f
+                    val half = cfg.wheelRows / 2f + 0.5f
                     val rh = rowH()
-                    bdTarget.set(20 * dp, h * cfg.verticalPos - rh * half, w - 20 * dp, h * cfg.verticalPos + rh * half)
+                    out.set(20 * dp, h * cfg.verticalPos - rh * half, w - 20 * dp, h * cfg.verticalPos + rh * half)
                     true
                 }
             }
@@ -422,7 +504,7 @@ class LyricsView(ctx: Context) : View(ctx) {
                 val l = curLayout
                 if (l == null) false else {
                     val tw = textW(l)
-                    bdTarget.set(popX - tw / 2 - padX, popY - l.height / 2f - padY, popX + tw / 2 + padX, popY + l.height / 2f + padY)
+                    out.set(popX - tw / 2f, popY - l.height / 2f, popX + tw / 2f, popY + l.height / 2f)
                     true
                 }
             }
@@ -432,13 +514,18 @@ class LyricsView(ctx: Context) : View(ctx) {
                     val baseY = h * cfg.verticalPos
                     val nl = nextLayout
                     val tw = max(textW(l), if (nl != null) textW(nl) else 0f)
-                    val top = baseY - l.height / 2f
                     val bottom = if (nl != null) baseY + l.height / 2f + 14 * dp + nl.height else baseY + l.height / 2f
-                    bdTarget.set(w / 2f - tw / 2f - padX, top - padY, w / 2f + tw / 2f + padX, bottom + padY)
+                    out.set(w / 2f - tw / 2f, baseY - l.height / 2f, w / 2f + tw / 2f, bottom)
                     true
                 }
             }
         }
+    }
+
+    private fun computeBackdropTarget(): Boolean {
+        if (!blockRect(bdTarget)) return false
+        if (cfg.subStyle != 3) bdTarget.inset(-18 * dp, -12 * dp)
+        return true
     }
 
     private fun drawBackdrop(c: Canvas) {

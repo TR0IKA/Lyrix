@@ -7,5 +7,6 @@ class LyrixApp : Application() {
         super.onCreate()
         Prefs.init(this)
         Favorites.init(this)
+        Library.init()
     }
 }

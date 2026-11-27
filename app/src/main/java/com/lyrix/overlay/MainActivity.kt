@@ -31,6 +31,17 @@ class MainActivity : ComponentActivity() {
         registerForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri -> uri?.let { exportTo(it) } }
     private val importer =
         registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> uri?.let { importFrom(it) } }
+    private var pendingAttach: Fav? = null
+    private val audioMulti =
+        registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+            if (uris.isNotEmpty()) importAudio(uris, null)
+        }
+    private val audioOne =
+        registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+            val f = pendingAttach
+            pendingAttach = null
+            if (uri != null && f != null) importAudio(listOf(uri), f)
+        }
     private val notifPerm =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
 
@@ -51,7 +62,12 @@ class MainActivity : ComponentActivity() {
                         pickBubbleIcon = { bubblePicker.launch("image/*") },
                         pickShortcutIcon = { shortcutPicker.launch("image/*") },
                         exportCfg = { exporter.launch("lyrix-settings.json") },
-                        importCfg = { importer.launch(arrayOf("*/*")) }
+                        importCfg = { importer.launch(arrayOf("*/*")) },
+                        addAudio = { audioMulti.launch(arrayOf("audio/*")) },
+                        attachAudio = { f ->
+                            pendingAttach = f
+                            audioOne.launch(arrayOf("audio/*"))
+                        }
                     )
                 )
             }
@@ -107,6 +123,13 @@ class MainActivity : ComponentActivity() {
             return
         }
         if (!ImageUtil.pinShortcut(this, bmp)) toast("Лаунчер не поддерживает ярлыки")
+    }
+
+    private fun importAudio(uris: List<Uri>, attach: Fav?) {
+        toast("Копирую в приложение…")
+        Library.importAsync(this, uris, attach) { n ->
+            toast(if (n > 0) "Добавлено: $n" else "Не удалось добавить файл")
+        }
     }
 
     private fun exportTo(uri: Uri) {

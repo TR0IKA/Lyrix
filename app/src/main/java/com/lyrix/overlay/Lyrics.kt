@@ -1,8 +1,10 @@
 package com.lyrix.overlay
 
+import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
+import android.net.Uri
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -74,13 +76,14 @@ object Lrc {
 object Net {
     fun enc(s: String): String = URLEncoder.encode(s, "UTF-8")
 
-    fun get(url: String): String? {
+    fun get(url: String, headers: Map<String, String> = emptyMap()): String? {
         var c: HttpURLConnection? = null
         return try {
             c = URL(url).openConnection() as HttpURLConnection
             c.connectTimeout = 8000
             c.readTimeout = 8000
             c.setRequestProperty("User-Agent", "Lyrix/1.1 (Android)")
+            for ((k, v) in headers) c.setRequestProperty(k, v)
             if (c.responseCode != 200) null else c.inputStream.bufferedReader().use { it.readText() }
         } catch (e: Exception) {
             null
@@ -197,12 +200,70 @@ object LyricsManager {
             }
         }
         // ремикс с другой длиной: берём ближайший по длине, тайминг можно подвинуть ползунком «Синхронизация»
-        return if (loose != null && looseDiff <= 90) loose else null
+        if (loose != null && looseDiff <= 90) return loose
+        // запасной источник
+        return fetchNetease(t, clean)
+    }
+
+    private val neteaseHeaders = mapOf("Referer" to "https://music.163.com/", "Cookie" to "appver=2.0.2; os=pc")
+
+    /** Запасной поиск синхронизированного текста (NetEase) — если на lrclib трека нет. */
+    private fun fetchNetease(t: Track, clean: String): String? {
+        return try {
+            val q = Net.enc(t.artist + " " + clean)
+            val body = Net.get(
+                "https://music.163.com/api/search/get/web?csrf_token=&hlpretag=&hlposttag=&s=$q&type=1&offset=0&total=true&limit=6",
+                neteaseHeaders
+            ) ?: return null
+            val songs = JSONObject(body).optJSONObject("result")?.optJSONArray("songs") ?: return null
+            val dur = (t.durationMs / 1000).toInt()
+            val cl = clean.lowercase()
+            var bestId = -1L
+            var bestDiff = Int.MAX_VALUE
+            for (i in 0 until songs.length()) {
+                val o = songs.optJSONObject(i) ?: continue
+                val name = o.optString("name").lowercase()
+                if (!(name.contains(cl) || cl.contains(name))) continue
+                val diff = if (dur > 0) abs(o.optInt("duration") / 1000 - dur) else 0
+                if (diff < bestDiff) {
+                    bestDiff = diff
+                    bestId = o.optLong("id")
+                }
+            }
+            if (bestId < 0 || (dur > 0 && bestDiff > 20)) return null
+            val lb = Net.get("https://music.163.com/api/song/lyric?id=$bestId&lv=1&kv=1&tv=-1", neteaseHeaders)
+                ?: return null
+            val lrc = JSONObject(lb).optJSONObject("lrc")?.optString("lyric")
+            if (!lrc.isNullOrBlank() && Lrc.parse(lrc).isNotEmpty()) lrc else null
+        } catch (e: Exception) {
+            null
+        }
     }
 }
 
 /** Ищет обложку в интернете, если плеер её не передал (iTunes Search). */
 object ArtFetcher {
+    private fun shrink(b: Bitmap): Bitmap {
+        val m = maxOf(b.width, b.height)
+        if (m <= 700) return b
+        val f = 700f / m
+        return Bitmap.createScaledBitmap(b, (b.width * f).toInt(), (b.height * f).toInt(), true)
+    }
+
+    /** Многие плееры отдают обложку не картинкой, а ссылкой (content:// или https://). */
+    suspend fun fromUri(ctx: Context, u: String, allowNet: Boolean): Bitmap? = withContext(Dispatchers.IO) {
+        try {
+            val bmp = if (u.startsWith("http", ignoreCase = true)) {
+                if (allowNet) URL(u).openStream().use { BitmapFactory.decodeStream(it) } else null
+            } else {
+                ctx.contentResolver.openInputStream(Uri.parse(u))?.use { BitmapFactory.decodeStream(it) }
+            }
+            bmp?.let { shrink(it) }
+        } catch (e: Exception) {
+            null
+        }
+    }
+
     suspend fun fetch(t: Track): Bitmap? = withContext(Dispatchers.IO) {
         try {
             val q = Net.enc("${t.artist} ${t.title}")

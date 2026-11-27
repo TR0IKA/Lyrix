@@ -52,7 +52,10 @@ private fun buildReport(ctx: android.content.Context, perms: PermState): String 
         LyricsState.Idle -> "—"
     })
     sb.appendLine("Кэш текстов: ${LyricsManager.cacheInfo()}")
-    sb.appendLine("Избранное: ${Favorites.list.value.size}")
+    sb.appendLine("Избранное: ${Favorites.list.value.size}, файлов в «Моей музыке»: ${Library.list.value.size}")
+    sb.appendLine()
+    sb.appendLine("Медиа-сессии:")
+    sb.appendLine(MediaListener.instance?.describe() ?: "слушатель не подключён")
     sb.appendLine()
     sb.appendLine("Настройки:")
     sb.appendLine(Prefs.config.value.toJson(false).toString(2))

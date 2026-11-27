@@ -67,7 +67,7 @@ class MediaListener : NotificationListenerService() {
 
     private val sessionsListener =
         MediaSessionManager.OnActiveSessionsChangedListener { list ->
-            setControllers((list ?: emptyList()).filter { it.packageName != packageName })
+            setControllers(list ?: emptyList())
         }
 
     override fun onListenerConnected() {
@@ -111,7 +111,7 @@ class MediaListener : NotificationListenerService() {
     fun refreshNow() {
         try {
             val m = msm ?: return
-            val list = m.getActiveSessions(comp).filter { it.packageName != packageName }
+            val list = m.getActiveSessions(comp)
             val same = list.size == controllers.size &&
                 list.indices.all { list[it].sessionToken == controllers[it].sessionToken }
             if (same) publish() else setControllers(list)
@@ -128,12 +128,30 @@ class MediaListener : NotificationListenerService() {
 
     private fun isPlaying(c: MediaController) = c.playbackState?.state == PlaybackState.STATE_PLAYING
 
+    /** Сессия «живая»: играет, буферизуется или подключается — таким отдаём приоритет. */
+    private fun isActive(c: MediaController): Boolean {
+        val s = c.playbackState?.state
+        return s == PlaybackState.STATE_PLAYING || s == PlaybackState.STATE_BUFFERING ||
+            s == PlaybackState.STATE_CONNECTING
+    }
+
+    /** Для диагностики (меню разработчика). */
+    fun describe(): String {
+        if (controllers.isEmpty()) return "нет активных медиа-сессий"
+        return controllers.joinToString("\n") { c ->
+            val m = c.metadata
+            "${c.packageName}: state=${c.playbackState?.state}, " +
+                "title=${m?.getString(MediaMetadata.METADATA_KEY_TITLE)}, " +
+                "display=${m?.getString(MediaMetadata.METADATA_KEY_DISPLAY_TITLE)}"
+        }
+    }
+
     private fun publish() {
         val cur = current?.let { c -> controllers.firstOrNull { it.sessionToken == c.sessionToken } }
-        val best: MediaController? = if (cur != null && isPlaying(cur)) {
+        val best: MediaController? = if (cur != null && isActive(cur)) {
             cur
         } else {
-            controllers.firstOrNull { isPlaying(it) } ?: cur ?: controllers.firstOrNull { it.metadata != null }
+            controllers.firstOrNull { isActive(it) } ?: cur ?: controllers.firstOrNull { it.metadata != null }
         }
         current = best
         NowPlaying.controller = best
@@ -142,13 +160,19 @@ class MediaListener : NotificationListenerService() {
             NowPlaying.set(PlayState())
             return
         }
-        val title = md.getString(MediaMetadata.METADATA_KEY_TITLE)
+        val title = md.getString(MediaMetadata.METADATA_KEY_TITLE)?.takeIf { it.isNotBlank() }
+            ?: md.getString(MediaMetadata.METADATA_KEY_DISPLAY_TITLE)
         if (title.isNullOrBlank()) {
             NowPlaying.set(PlayState())
             return
         }
-        val artist = md.getString(MediaMetadata.METADATA_KEY_ARTIST)
-            ?: md.getString(MediaMetadata.METADATA_KEY_ALBUM_ARTIST) ?: ""
+        val artist = md.getString(MediaMetadata.METADATA_KEY_ARTIST)?.takeIf { it.isNotBlank() }
+            ?: md.getString(MediaMetadata.METADATA_KEY_ALBUM_ARTIST)?.takeIf { it.isNotBlank() }
+            ?: md.getString(MediaMetadata.METADATA_KEY_AUTHOR)?.takeIf { it.isNotBlank() }
+            ?: md.getString(MediaMetadata.METADATA_KEY_DISPLAY_SUBTITLE) ?: ""
+        val artUri = md.getString(MediaMetadata.METADATA_KEY_ALBUM_ART_URI)
+            ?: md.getString(MediaMetadata.METADATA_KEY_ART_URI)
+            ?: md.getString(MediaMetadata.METADATA_KEY_DISPLAY_ICON_URI)
         val album = md.getString(MediaMetadata.METADATA_KEY_ALBUM) ?: ""
         val dur = md.getLong(MediaMetadata.METADATA_KEY_DURATION)
         val rawArt = md.getBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART)
@@ -160,7 +184,7 @@ class MediaListener : NotificationListenerService() {
         val track = if (prev != null && lastMetaKey == metaKey && (prev.art != null || rawArt == null)) {
             prev
         } else {
-            Track(title, artist, album, dur, rawArt?.let { scale(it) }, best.packageName).also {
+            Track(title, artist, album, dur, rawArt?.let { scale(it) }, best.packageName, artUri).also {
                 lastTrack = it
                 lastMetaKey = metaKey
             }
